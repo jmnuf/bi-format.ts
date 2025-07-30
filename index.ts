@@ -1,5 +1,14 @@
 type Result<Val, Err> = { ok: true; value: Val; } | { ok: false; error: Err; };
 
+const Result = Object.freeze({
+  Ok<T, E>(value: T): Result<T, E> {
+    return { ok: true, value };
+  },
+  Err<T, E>(error: E): Result<T, E> {
+    return { ok: false, error };
+  },
+});
+
 type NativeFieldKind = 'int' | 'blob';
 type TransformedFieldKind = 'json' | 'utf8' | 'bifmt';
 
@@ -13,10 +22,10 @@ type BiFmtNativeField<Kind extends NativeFieldKind = NativeFieldKind> = {
 
 type BiFmtTransformedField<Kind extends TransformedFieldKind = TransformedFieldKind> = {
   [K in TransformedFieldKind]: K extends 'json'
-  ? { kind: 'json'; name: string; value: unknown; }
+  ? { kind: 'json'; name: string; value: unknown; buffer: Uint8Array; }
   : K extends 'utf8'
-  ? { kind: 'utf8'; name: string; value: string; }
-  : { kind: `Unsupported transformed field kind ${Kind}`, name: string; };
+  ? { kind: 'utf8'; name: string; value: string; buffer: Uint8Array; }
+  : { kind: `Unsupported transformed field kind ${Kind}`, name: string; buffer: Uint8Array; };
 }[Kind];
 
 type BiFmtField =
@@ -121,7 +130,7 @@ export interface BiFmtReader {
   on_eof: () => boolean;
 }
 
-function concat_u8_to_bytes(base: Uint8Array, ...others: Bytes[]): Uint8Array {
+function concat_u8_to_bytes<Base extends Uint8Array<any>>(base: Base, ...others: [Bytes, ...Bytes[]]): Uint8Array<ArrayBuffer> {
   let result = Uint8Array.from(base);
   for (const othr of others) {
     result = Uint8Array.from(new Proxy({ length: result.length + othr.length }, {
@@ -161,7 +170,7 @@ class BiFormatReader implements BiFmtReader {
 
   append_bytes(othr: Bytes): void;
   append_bytes(othr: Bytes, ...extras: Bytes[]): void;
-  append_bytes(...extras: Bytes[]): void {
+  append_bytes(...extras: [Bytes, ...Bytes[]]): void {
     this.#bytes = concat_u8_to_bytes(this.#bytes, ...extras);
   }
 
@@ -507,13 +516,13 @@ export function expect_bifmt_field_kind<Kind extends BiFmtFieldKind>(field: BiFm
     }
 
     if (kind === 'utf8') {
-      const v: BiFmtTransformedField<'utf8'> = { kind, name: field.name, value: text };
+      const v: BiFmtTransformedField<'utf8'> = { kind, name: field.name, value: text, buffer: field.value };
       return { ok: true, value: v as any };
     }
 
     try {
       const json = JSON.parse(text) as any;
-      const v: BiFmtTransformedField<'json'> = { kind, name: field.name, value: json };
+      const v: BiFmtTransformedField<'json'> = { kind, name: field.name, value: json, buffer: field.value };
       return { ok: true, value: v as any };
     } catch (e) {
       console.error(e);
@@ -527,5 +536,116 @@ export function expect_bifmt_field_kind<Kind extends BiFmtFieldKind>(field: BiFm
   }
 
   return { ok: false, error: `Unable to check if field matches for unsupported kind: ${kind}` };
+}
+
+function generate_int_field_bytes(value: number): Uint8Array {
+  const str_val = value.toString(10);
+  let bytes = new Uint8Array(4 + str_val.length);
+  let i = 0;
+  bytes[i++] = FIELD_START_BYTE;
+  bytes[i++] = FIELD_INT_KIND_BYTE;
+  bytes[i++] = FIELD_PIECE_SEPARATOR_BYTE;
+  for (const char of str_val) {
+    let b: undefined | number;
+    switch (char) {
+      case '0': b = FIELD_INT_LITERAL_0_BYTE; break;
+      case '1': b = FIELD_INT_LITERAL_1_BYTE; break;
+      case '2': b = FIELD_INT_LITERAL_2_BYTE; break;
+      case '3': b = FIELD_INT_LITERAL_3_BYTE; break;
+      case '4': b = FIELD_INT_LITERAL_4_BYTE; break;
+      case '5': b = FIELD_INT_LITERAL_5_BYTE; break;
+      case '6': b = FIELD_INT_LITERAL_6_BYTE; break;
+      case '7': b = FIELD_INT_LITERAL_7_BYTE; break;
+      case '8': b = FIELD_INT_LITERAL_8_BYTE; break;
+      case '9': b = FIELD_INT_LITERAL_9_BYTE; break;
+    }
+    if (b == undefined) continue;
+    if (i >= bytes.length) {
+      const n = Uint8Array.from([b]);
+      bytes = concat_u8_to_bytes(bytes, n);
+      continue;
+    }
+    bytes[i++] = b;
+  }
+  return concat_u8_to_bytes(bytes, [FIELD_DATA_SEPARATOR_BYTE]);
+}
+
+function generate_blob_field_bytes_for_string(str: string) {
+  const encoder = new TextEncoder();
+  const blob = encoder.encode(str);
+  return generate_blob_field_bytes_for_bytes(blob);
+}
+function generate_blob_field_bytes_for_bytes(blob: Bytes) {
+  const encoder = new TextEncoder();
+  const length = encoder.encode(blob.length.toString(10));
+  return concat_u8_to_bytes(
+    Uint8Array.from([FIELD_START_BYTE, FIELD_BLOB_KIND_BYTE, FIELD_PIECE_SEPARATOR_BYTE]),
+    length,
+    [FIELD_DATA_SEPARATOR_BYTE],
+    blob,
+    [FIELD_DATA_SEPARATOR_BYTE],
+  );
+}
+
+export function object_to_bi_format(obj: Record<string, unknown>): Result<Uint8Array, string> {
+  const fields: Uint8Array[] = [];
+
+  try {
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (v == null) {
+        return Result.Err(`Invalid value for key ${k}, can not turn null/undefined to a value in BiF`);
+      }
+
+      if (typeof v == 'string') {
+        const buf = generate_blob_field_bytes_for_string(v);
+        fields.push(buf);
+        continue;
+      }
+
+      if (typeof v == 'number') {
+        if (Number.isInteger(v)) {
+          const buf = generate_int_field_bytes(v);
+          fields.push(buf);
+          continue;
+        }
+      }
+
+      if (Array.isArray(v)) {
+        const str = JSON.stringify(v);
+        const buf = generate_blob_field_bytes_for_string(str);
+        fields.push(buf);
+        continue;
+      }
+
+      if (typeof v == 'object') {
+        const result = object_to_bi_format(v as any);
+        if (!result.ok) {
+          const str = JSON.stringify(v);
+          const buf = generate_blob_field_bytes_for_string(str);
+          fields.push(buf);
+          continue;
+        }
+        const subbif = result.value;
+        const buf = generate_blob_field_bytes_for_bytes(subbif);
+        fields.push(buf);
+        continue;
+      }
+
+      const str = JSON.stringify(v);
+      const buf = generate_blob_field_bytes_for_string(str);
+      fields.push(buf);
+    }
+  } catch (err) {
+    return Result.Err(`Failed to serialize object: ${err}`);
+  }
+
+  return Result.Ok(
+    fields.length == 0
+      ? new Uint8Array(0)
+      : fields.length == 1
+        ? fields[0]!
+        : concat_u8_to_bytes(new Uint8Array(0), ...(fields as [Uint8Array, ...Uint8Array[]]))
+  );
 }
 
