@@ -10,7 +10,12 @@ const Result = Object.freeze({
 });
 
 type NativeFieldKind = 'int' | 'blob';
-type TransformedFieldKind = 'json' | 'utf8' | 'bifmt';
+type TransformedFieldKind =
+  | 'json'
+  | 'utf8'
+  // | 'flt32'
+  | 'bifmt'
+  ;
 
 type BiFmtNativeField<Kind extends NativeFieldKind = NativeFieldKind> = {
   [K in NativeFieldKind]: K extends 'int'
@@ -25,6 +30,8 @@ type BiFmtTransformedField<Kind extends TransformedFieldKind = TransformedFieldK
   ? { kind: 'json'; name: string; value: unknown; buffer: Uint8Array; }
   : K extends 'utf8'
   ? { kind: 'utf8'; name: string; value: string; buffer: Uint8Array; }
+  // : K extends 'flt32'
+  // ? { kind: 'flt32'; name: string; value: number; buffer: Uint8Array; }
   : { kind: `Unsupported transformed field kind ${Kind}`, name: string; buffer: Uint8Array; };
 }[Kind];
 
@@ -41,7 +48,7 @@ type PickBiFmtField<Kind extends BiFmtFieldKind> = {
 }[Kind];
 
 interface BiFmtStruct {
-  [field: string]: BiFmtField;
+  [field: string]: BiFmtField | [BiFmtField, BiFmtField, ...BiFmtField[]];
 }
 
 type Bytes = Uint8Array | Uint8ClampedArray | number[];
@@ -177,10 +184,10 @@ class BiFormatReader implements BiFmtReader {
   drop_bytes(n: number = this.#offset): void {
     const off = this.#offset;
     if (n > off) {
-      console.warn('[BiFormatReader] Dropping more bytes than read!');
+      console.warn('[BiFormatReader] Attempting to drop more bytes than read!');
     }
     if (n > this.#bytes.length) {
-      console.error('[BiFormatReader] Attempting to drop more bytes than buffered');
+      console.error('[BiFormatReader] Attempting to drop more bytes than buffered!');
     }
     const count = Math.max(this.#bytes.length - n, 0);
     const bytes = new Uint8Array(count);
@@ -235,183 +242,190 @@ class BiFormatReader implements BiFmtReader {
   on_eof() {
     return this.#offset >= this.#bytes.length;
   }
+
+  read_field(): BiFmtNativeField {
+    const reader = this;
+
+    while (reader.on_byte(FIELD_DATA_SEPARATOR_BYTE)) {
+      reader.next();
+    }
+
+    if (reader.on_eof()) {
+      throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_START_BYTE);
+    }
+
+    if (!reader.on_byte(FIELD_START_BYTE)) {
+      throw new ParseBiFmtFieldUnexpectedByteError(FIELD_START_BYTE, reader.cursor);
+    }
+
+    if (reader.next() == null) {
+      throw new ParseBiFmtFieldUnexpectedEOFError();
+    }
+
+    switch (reader.cursor) {
+      case FIELD_INT_KIND_BYTE: {
+        reader.next();
+        if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
+          throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
+        }
+
+        const buffer = [] as number[];
+        while (!reader.on_eof()) {
+          const cursor = reader.next();
+          if (cursor == null) {
+            throw new ParseBiFmtFieldUnexpectedEOFError();
+          }
+
+          if (MIN_PRINTABLE_ASCII_TABLE_BYTE <= cursor && cursor <= MAX_PRINTABLE_ASCII_TABLE_BYTE) {
+            buffer.push(cursor);
+            continue;
+          }
+
+          if (cursor === FIELD_PIECE_SEPARATOR_BYTE) {
+            break;
+          }
+
+          const expected_byte = buffer.length == 0 ? 69 /* 'E' */ : FIELD_PIECE_SEPARATOR_BYTE;
+
+          throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
+        }
+
+        if (buffer.length == 0) {
+          throw new ParseBiFmtFieldMissingNameError();
+        }
+
+        const name = new TextDecoder().decode(Uint8Array.from(buffer));
+
+        if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
+          throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
+        }
+
+        buffer.length = 0;
+        while (!reader.on_eof()) {
+          const cursor = reader.next();
+          if (cursor == null) {
+            throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_INT_LITERAL_0_BYTE);
+          }
+
+          if (FIELD_INT_LITERAL_BYTES.includes(cursor as any)) {
+            buffer.push(cursor);
+            continue;
+          }
+
+          if (cursor === FIELD_DATA_SEPARATOR_BYTE) {
+            break;
+          }
+
+          const expected_byte = buffer.length == 0 ? FIELD_INT_LITERAL_0_BYTE : FIELD_DATA_SEPARATOR_BYTE;
+
+          throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
+        }
+
+        const value = Number(new TextDecoder().decode(Uint8Array.from(buffer)));
+
+        return { kind: 'int', name, value };
+      };
+
+      case FIELD_BLOB_KIND_BYTE: {
+        reader.next();
+        if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
+          throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
+        }
+
+        const buffer = [] as number[];
+        while (!reader.on_eof()) {
+          const cursor = reader.next();
+          if (cursor == null) {
+            throw new ParseBiFmtFieldUnexpectedEOFError();
+          }
+
+          if (MIN_PRINTABLE_ASCII_TABLE_BYTE <= cursor && cursor <= MAX_PRINTABLE_ASCII_TABLE_BYTE) {
+            buffer.push(cursor);
+            continue;
+          }
+
+          if (cursor === FIELD_PIECE_SEPARATOR_BYTE) {
+            break;
+          }
+
+          const expected_byte = buffer.length == 0 ? 69 /* 'E' */ : FIELD_PIECE_SEPARATOR_BYTE;
+
+          throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
+        }
+
+        if (buffer.length == 0) {
+          throw new ParseBiFmtFieldMissingNameError();
+        }
+
+        const name = new TextDecoder().decode(Uint8Array.from(buffer));
+
+        if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
+          throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
+        }
+
+        buffer.length = 0;
+        while (!reader.on_eof()) {
+          const cursor = reader.next();
+          if (cursor == null) {
+            throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_INT_LITERAL_0_BYTE);
+          }
+
+          if (FIELD_INT_LITERAL_BYTES.includes(cursor as any)) {
+            buffer.push(cursor);
+            continue;
+          }
+
+          if (cursor === FIELD_DATA_SEPARATOR_BYTE) {
+            break;
+          }
+
+          const expected_byte = buffer.length == 0 ? FIELD_INT_LITERAL_0_BYTE : FIELD_DATA_SEPARATOR_BYTE;
+
+          throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
+        }
+
+        const size = Number(new TextDecoder().decode(Uint8Array.from(buffer)));
+        buffer.length = 0;
+
+        const value = new Uint8Array(size);
+        for (let i = 0; i < size; ++i) {
+          const cursor = reader.next();
+          if (cursor == null) {
+            throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_DATA_SEPARATOR_BYTE);
+          }
+
+          buffer.push(reader.cursor);
+          value[i] = cursor;
+        }
+
+        return { kind: 'blob', name, value };
+      };
+
+      default: {
+        throw new ParseBiFmtFieldInvalidKindError(reader.cursor);
+      };
+    }
+
+  }
+
+
+  try_read_field(): Result<BiFmtNativeField, ParseBiFmtFieldError> {
+    try {
+      return { ok: true, value: this.read_field() };
+    } catch (e) {
+      return { ok: false, error: e as ParseBiFmtFieldError };
+    }
+  }
 }
 
-function read_bi_format_field(reader: BiFmtReader): BiFmtNativeField {
-  while (reader.on_byte(FIELD_DATA_SEPARATOR_BYTE)) {
-    reader.next();
-  }
 
-  if (reader.on_eof()) {
-    throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_START_BYTE);
-  }
+export const create_reader = (initial_bytes: Bytes = []) => new BiFormatReader(initial_bytes);
 
-  if (!reader.on_byte(FIELD_START_BYTE)) {
-    throw new ParseBiFmtFieldUnexpectedByteError(FIELD_START_BYTE, reader.cursor);
-  }
-
-  if (reader.next() == null) {
-    throw new ParseBiFmtFieldUnexpectedEOFError();
-  }
-
-  switch (reader.cursor) {
-    case FIELD_INT_KIND_BYTE: {
-      reader.next();
-      if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
-        throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
-      }
-
-      const buffer = [] as number[];
-      while (!reader.on_eof()) {
-        const cursor = reader.next();
-        if (cursor == null) {
-          throw new ParseBiFmtFieldUnexpectedEOFError();
-        }
-
-        if (MIN_PRINTABLE_ASCII_TABLE_BYTE <= cursor && cursor <= MAX_PRINTABLE_ASCII_TABLE_BYTE) {
-          buffer.push(cursor);
-          continue;
-        }
-
-        if (cursor === FIELD_PIECE_SEPARATOR_BYTE) {
-          break;
-        }
-
-        const expected_byte = buffer.length == 0 ? 69 /* 'E' */ : FIELD_PIECE_SEPARATOR_BYTE;
-
-        throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
-      }
-
-      if (buffer.length == 0) {
-        throw new ParseBiFmtFieldMissingNameError();
-      }
-
-      const name = new TextDecoder().decode(Uint8Array.from(buffer));
-
-      if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
-        throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
-      }
-
-      buffer.length = 0;
-      while (!reader.on_eof()) {
-        const cursor = reader.next();
-        if (cursor == null) {
-          throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_INT_LITERAL_0_BYTE);
-        }
-
-        if (FIELD_INT_LITERAL_BYTES.includes(cursor as any)) {
-          buffer.push(cursor);
-          continue;
-        }
-
-        if (cursor === FIELD_DATA_SEPARATOR_BYTE) {
-          break;
-        }
-
-        const expected_byte = buffer.length == 0 ? FIELD_INT_LITERAL_0_BYTE : FIELD_DATA_SEPARATOR_BYTE;
-
-        throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
-      }
-
-      const value = Number(new TextDecoder().decode(Uint8Array.from(buffer)));
-
-      return { kind: 'int', name, value };
-    };
-
-    case FIELD_BLOB_KIND_BYTE: {
-      reader.next();
-      if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
-        throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
-      }
-
-      const buffer = [] as number[];
-      while (!reader.on_eof()) {
-        const cursor = reader.next();
-        if (cursor == null) {
-          throw new ParseBiFmtFieldUnexpectedEOFError();
-        }
-
-        if (MIN_PRINTABLE_ASCII_TABLE_BYTE <= cursor && cursor <= MAX_PRINTABLE_ASCII_TABLE_BYTE) {
-          buffer.push(cursor);
-          continue;
-        }
-
-        if (cursor === FIELD_PIECE_SEPARATOR_BYTE) {
-          break;
-        }
-
-        const expected_byte = buffer.length == 0 ? 69 /* 'E' */ : FIELD_PIECE_SEPARATOR_BYTE;
-
-        throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
-      }
-
-      if (buffer.length == 0) {
-        throw new ParseBiFmtFieldMissingNameError();
-      }
-
-      const name = new TextDecoder().decode(Uint8Array.from(buffer));
-
-      if (!reader.on_byte(FIELD_PIECE_SEPARATOR_BYTE)) {
-        throw new ParseBiFmtFieldUnexpectedByteError(FIELD_PIECE_SEPARATOR_BYTE, reader.cursor);
-      }
-
-      buffer.length = 0;
-      while (!reader.on_eof()) {
-        const cursor = reader.next();
-        if (cursor == null) {
-          throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_INT_LITERAL_0_BYTE);
-        }
-
-        if (FIELD_INT_LITERAL_BYTES.includes(cursor as any)) {
-          buffer.push(cursor);
-          continue;
-        }
-
-        if (cursor === FIELD_DATA_SEPARATOR_BYTE) {
-          break;
-        }
-
-        const expected_byte = buffer.length == 0 ? FIELD_INT_LITERAL_0_BYTE : FIELD_DATA_SEPARATOR_BYTE;
-
-        throw new ParseBiFmtFieldUnexpectedByteError(expected_byte, cursor);
-      }
-
-      const size = Number(new TextDecoder().decode(Uint8Array.from(buffer)));
-      buffer.length = 0;
-
-      const value = new Uint8Array(size);
-      for (let i = 0; i < size; ++i) {
-        const cursor = reader.next();
-        if (cursor == null) {
-          throw new ParseBiFmtFieldUnexpectedEOFError(FIELD_DATA_SEPARATOR_BYTE);
-        }
-
-        buffer.push(reader.cursor);
-        value[i] = cursor;
-      }
-
-      return { kind: 'blob', name, value };
-    };
-
-    default: {
-      throw new ParseBiFmtFieldInvalidKindError(reader.cursor);
-    };
-  }
-
-}
-
-export const try_read_bi_format_field = (reader: BiFmtReader): Result<BiFmtNativeField, ParseBiFmtFieldError> => {
-  try {
-    return { ok: true, value: read_bi_format_field(reader) };
-  } catch (e) {
-    return { ok: false, error: e as ParseBiFmtFieldError };
-  }
-};
 
 export async function parse_bi_format_stream(stream: ReadableStream<Bytes>): Promise<Result<BiFmtStruct, ParseBiFmtFieldError>> {
   const stream_reader = stream.getReader();
   let step = await stream_reader.read();
-  const bif_reader = new BiFormatReader(step.value ?? []);
+  const bif_reader = create_reader(step.value ?? []);
   const struct = {} as BiFmtStruct;
 
   while (!step.done) {
@@ -419,7 +433,7 @@ export async function parse_bi_format_stream(stream: ReadableStream<Bytes>): Pro
     bif_reader.append_bytes(bytes);
     bif_reader.save_point();
 
-    const result = try_read_bi_format_field(bif_reader);
+    const result = bif_reader.try_read_field();
     if (result.ok) {
       bif_reader.drop_save_point();
       const field = result.value;
@@ -438,7 +452,7 @@ export async function parse_bi_format_stream(stream: ReadableStream<Bytes>): Pro
   }
 
   while (!bif_reader.on_eof()) {
-    const result = try_read_bi_format_field(bif_reader);
+    const result = bif_reader.try_read_field();
     if (!result.ok) return result;
     const field = result.value;
     struct[field.name] = field;
@@ -448,13 +462,13 @@ export async function parse_bi_format_stream(stream: ReadableStream<Bytes>): Pro
 }
 
 export function* step_parse_bi_format(bytes: Bytes): Generator<BiFmtNativeField | null, Result<BiFmtStruct, ParseBiFmtFieldError>, Bytes | null | undefined> {
-  const reader = new BiFormatReader(bytes);
+  const reader = create_reader(bytes);
   const struct = {} as BiFmtStruct;
 
   while (!reader.on_eof()) {
     reader.save_point();
 
-    const result = try_read_bi_format_field(reader);
+    const result = reader.try_read_field();
     if (!result.ok) {
       if (result.error instanceof ParseBiFmtFieldUnexpectedEOFError) {
         const extra = yield null;
@@ -469,7 +483,16 @@ export function* step_parse_bi_format(bytes: Bytes): Generator<BiFmtNativeField 
     reader.drop_save_point();
 
     const field = result.value;
-    struct[field.name] = field;
+    if (field.name in struct) {
+      const struct_field = struct[field.name]!;
+      if (Array.isArray(struct_field)) {
+        struct_field.push(field);
+      } else {
+        struct[field.name] = [struct_field, field];
+      }
+    } else {
+      struct[field.name] = field;
+    }
 
     const extra = yield field;
     if (extra != null) {
@@ -489,7 +512,7 @@ export function sync_parse_bi_format(bytes: Bytes) {
   return step.value;
 }
 
-export function expect_bifmt_field_kind<Kind extends BiFmtFieldKind>(field: BiFmtField, kind: Kind): Result<PickBiFmtField<Kind>, string> {
+export function expect_bifmt_field_kind<Kind extends BiFmtFieldKind>(field: BiFmtNativeField, kind: Kind): Result<PickBiFmtField<Kind>, string> {
   if (kind === 'int' || kind === 'blob') {
     if (field.kind !== kind) {
       return { ok: false, error: `Field ${field.name} has kind ${field.kind} but expected ${kind}` };
@@ -523,23 +546,35 @@ export function expect_bifmt_field_kind<Kind extends BiFmtFieldKind>(field: BiFm
     try {
       const json = JSON.parse(text) as any;
       const v: BiFmtTransformedField<'json'> = { kind, name: field.name, value: json, buffer: field.value };
-      return { ok: true, value: v as any };
+      return Result.Ok(v as any);
     } catch (e) {
       console.error(e);
 
       if (e instanceof Error) {
-        return { ok: false, error: `Failed to parse utf8 blob as valid JSON: ${e.message}` };
+        return Result.Err(`Failed to parse utf8 blob as valid JSON: ${e.message}`);
       }
 
-      return { ok: false, error: 'Failed to parse utf8 blob as valid JSON for an unknown reason' };
+      return Result.Err('Failed to parse utf8 blob as valid JSON for an unknown reason');
     }
   }
 
-  return { ok: false, error: `Unable to check if field matches for unsupported kind: ${kind}` };
+  // if (kind == 'flt32') {
+  //   if (field.kind !== 'blob') {
+  //     return Result.Err('Field is not a set of bytes representing a 32 bit float');
+  //   }
+  //   const view = new DataView(field.value.buffer, field.value.byteOffset, field.value.byteLength);
+  //   const value = view.getFloat32(0, true);
+  //   const v: BiFmtTransformedField<'flt32'> = { kind, name: field.name, value, buffer: field.value };
+  //   return Result.Ok(v as any);
+  // }
+
+  return { ok: false, error: `Unable to check if field is transformable to unsupported kind: ${kind}` };
 }
 
 function generate_int_field_bytes(value: number): Uint8Array {
-  const str_val = value.toString(10);
+  if (Number.isNaN(value)) throw new TypeError('Attempting to generate integer field bytes with NaN value');
+  if (!Number.isFinite(value)) throw new TypeError('Attempting to generate integer field bytes with an Infinity value');
+  const str_val = (Number.isInteger(value) ? value : Math.floor(value)).toString(10);
   let bytes = new Uint8Array(4 + str_val.length);
   let i = 0;
   bytes[i++] = FIELD_START_BYTE;
